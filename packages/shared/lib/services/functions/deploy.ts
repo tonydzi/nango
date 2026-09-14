@@ -9,6 +9,7 @@ import * as functionInstanceService from './models/instances.js';
 import { reconcile } from './reconcile.js';
 import { functionVersionHash } from './version.js';
 
+import type { Orchestrator } from '../../clients/orchestrator.js';
 import type { CurrentFunctionConfig } from './models/functions.js';
 import type { FunctionInstanceUpsert } from './models/instances.js';
 import type { DeploymentBundleReconciliation } from './reconcile.js';
@@ -81,12 +82,14 @@ export async function deployBundle({
     accountId,
     environmentId,
     environmentName,
-    reconciliation
+    reconciliation,
+    orchestrator
 }: {
     accountId: number;
     environmentId: number;
     environmentName: string;
     reconciliation: DeploymentBundleReconciliation;
+    orchestrator: Pick<Orchestrator, 'scheduleFunctions' | 'deleteFunctionSchedules'>;
 }): Promise<Result<void, DeploymentBundleError>> {
     try {
         // Upload the files first and upsert/delete the configs in a single transaction
@@ -129,7 +132,7 @@ export async function deployBundle({
             prepared.push({ before, artifact, version, fileLocation });
         }
 
-        await db.knex.transaction(async (trx) => {
+        const removedInstances = await db.knex.transaction(async (trx) => {
             // Upsert function configs/versions
             const configsToUpsert = prepared.map(({ artifact, version, fileLocation }) => ({
                 environmentId,
@@ -172,8 +175,7 @@ export async function deployBundle({
             const instancesToUpsert: FunctionInstanceUpsert[] = [];
             const instancesToDelete: { functionConfigId: number }[] = reconciliation.deleted.map((f) => ({ functionConfigId: f.config.id }));
             for (const { before, artifact } of prepared) {
-                var upsertCandidate: { functionConfigId: number; integrationId: number; artifact: FunctionDeploymentArtifact; frequency: string } | undefined =
-                    undefined;
+                var upsertCandidate: { functionConfigId: number; integrationId: number; artifact: FunctionDeploymentArtifact } | undefined = undefined;
 
                 // If the after trigger is a schedule and there is no before store, create a new instance
                 if (artifact.trigger.kind === 'schedule' && !before) {
@@ -182,8 +184,7 @@ export async function deployBundle({
                         upsertCandidate = {
                             functionConfigId: functionConfig.config.id,
                             integrationId: functionConfig.integration.id,
-                            artifact,
-                            frequency: artifact.trigger.frequency
+                            artifact
                         };
                     }
                 }
@@ -192,8 +193,7 @@ export async function deployBundle({
                     upsertCandidate = {
                         functionConfigId: before.config.id,
                         integrationId: before.integration.id,
-                        artifact,
-                        frequency: artifact.trigger.frequency
+                        artifact
                     };
                 }
 
@@ -208,7 +208,7 @@ export async function deployBundle({
                             nango_connection_id: connection.id,
                             name: upsertCandidate.artifact.name,
                             variant: 'base',
-                            frequency: upsertCandidate.frequency
+                            frequency: null
                         });
                     }
                 }
@@ -236,8 +236,58 @@ export async function deployBundle({
             if (deletedInstances.isErr()) {
                 throw deletedInstances.error;
             }
+            return deletedInstances.value;
         });
 
+        // instances are commited before creating schedules so they are visible when execution starts.
+        // HTTP failures fail deployment but leave committed data intact.
+        if (removedInstances.length > 0) {
+            const schedulesDeletion = await orchestrator.deleteFunctionSchedules({
+                environmentId,
+                instanceIds: removedInstances.map((instance) => instance.id)
+            });
+            if (schedulesDeletion.isErr()) {
+                throw schedulesDeletion.error;
+            }
+        }
+
+        // Unchanged functions are included so redeploying repairs missing schedules.
+        const desiredSchedules = [...reconciliation.created, ...reconciliation.updated.map(({ after }) => after), ...reconciliation.unchanged].filter(
+            (artifact) => artifact.trigger.kind === 'schedule'
+        );
+
+        for (const [integrationId, artifacts] of Map.groupBy(desiredSchedules, (artifact) => artifact.integrationId)) {
+            const configs = (await functionConfigService.search(db.knex, { environmentId, filter: { integrationKey: integrationId } })).unwrap();
+            const byName = new Map(configs.map((config) => [config.config.name, config]));
+            for (const artifact of artifacts) {
+                if (artifact.trigger.kind !== 'schedule') {
+                    continue;
+                }
+                const config = byName.get(artifact.name);
+                if (!config) {
+                    throw new Error(`Deployed function '${integrationId}/${artifact.name}' not found`);
+                }
+                let afterId = 0;
+                while (true) {
+                    const instances = await functionInstanceService.search(db.knex, { functionConfigIds: [config.config.id], afterId, limit: 1000 });
+                    if (instances.isErr()) {
+                        throw instances.error;
+                    }
+                    if (instances.value.length === 0) {
+                        break;
+                    }
+                    const frequencyFallback = artifact.trigger.frequency;
+                    const autoStart = config.config.enabled && (artifact.trigger.autoStart ?? true);
+                    const scheduled = await orchestrator.scheduleFunctions(
+                        instances.value.map((instance) => ({ environmentId, instance, frequencyFallback, autoStart }))
+                    );
+                    if (scheduled.isErr()) {
+                        throw scheduled.error;
+                    }
+                    afterId = instances.value[instances.value.length - 1]!.id;
+                }
+            }
+        }
         return Ok(undefined);
     } catch (err) {
         return Err(functionsDeploymentError(err));

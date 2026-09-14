@@ -375,8 +375,48 @@ export class Scheduler {
      * };
      * const schedule = await scheduler.recurring(schedulingProps);
      */
-    public async recurring(props: ScheduleProps): Promise<Result<Schedule>> {
-        return schedules.create(this.db, props);
+    public async recurring(props: ScheduleProps): Promise<Result<Schedule>>;
+    public async recurring(props: ScheduleProps[]): Promise<Result<Schedule[]>>;
+    public async recurring(props: ScheduleProps | ScheduleProps[]): Promise<Result<Schedule | Schedule[]>> {
+        const entries = Array.isArray(props) ? props : [props];
+
+        try {
+            const result = await this.db.transaction(async (trx) => {
+                const created = await schedules.createBatch(trx, entries);
+                if (created.isErr()) {
+                    throw created.error;
+                }
+
+                const updates: { id: string; frequencyMs: number }[] = [];
+                const byName = new Map(created.value.map((schedule) => [schedule.name, schedule]));
+                for (const requested of entries) {
+                    const schedule = byName.get(requested.name);
+                    if (!schedule) {
+                        throw new Error(`Schedule '${requested.name}' missing after creation`);
+                    }
+
+                    if (schedule.frequencyMs !== requested.frequencyMs) {
+                        updates.push({
+                            id: schedule.id,
+                            frequencyMs: requested.frequencyMs
+                        });
+                    }
+                }
+
+                const updated = await schedules.update(trx, updates);
+                if (updated.isErr()) {
+                    throw updated.error;
+                }
+                for (const schedule of updated.value) {
+                    byName.set(schedule.name, schedule);
+                }
+                return Array.from(byName.values());
+            });
+
+            return Ok(Array.isArray(props) ? result : result[0]!);
+        } catch (err) {
+            return Err(err instanceof Error ? err : new Error(stringifyError(err)));
+        }
     }
 
     /**
@@ -705,11 +745,11 @@ export class Scheduler {
             if (schedule.value[0].frequencyMs === frequencyMs) {
                 return Ok(schedule.value[0]);
             }
-            const res = await schedules.update(trx, { id: schedule.value[0].id, frequencyMs });
+            const res = await schedules.update(trx, [{ id: schedule.value[0].id, frequencyMs }]);
             if (res.isErr()) {
                 return Err(`Error updating schedule frequency '${scheduleName}': ${stringifyError(res.error)}`);
             }
-            return res;
+            return Ok(res.value[0]!);
         });
     }
 
